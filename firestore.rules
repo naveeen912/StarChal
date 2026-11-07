@@ -1,0 +1,38 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow write: if signedIn() && request.auth.uid == uid;
+    }
+    match /lobby/{doc} {
+      allow read, write: if signedIn();
+    }
+    match /games/{code} {
+      function isPlayer(d) {
+        return request.auth.uid == d.host.id || (d.guest != null && request.auth.uid == d.guest.id);
+      }
+      function myRole(d) {
+        return request.auth.uid == d.host.id ? d.host.role : d.guest.role;
+      }
+      function turnUid(d) {
+        return d.turn == d.host.role ? d.host.id : d.guest.id;
+      }
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.host.id == request.auth.uid;
+      allow delete: if signedIn() && resource.data.host.id == request.auth.uid;
+      allow update: if signedIn() && (
+        (resource.data.guest == null
+          && request.resource.data.guest.id == request.auth.uid
+          && request.resource.data.host.id == resource.data.host.id)
+        || (isPlayer(resource.data) && (
+              resource.data.status != 'playing'
+              || turnUid(resource.data) == request.auth.uid
+              || (request.resource.data.status == 'finished'
+                  && request.resource.data.winner != myRole(resource.data))))
+      );
+    }
+  }
+}
