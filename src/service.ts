@@ -1,4 +1,4 @@
-import { collection, deleteDoc, doc, getDoc, getDocs, increment, limit, onSnapshot, orderBy, query, runTransaction, setDoc, updateDoc } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, increment, limit, onSnapshot, orderBy, query, runTransaction, serverTimestamp, setDoc, Timestamp, updateDoc } from 'firebase/firestore';
 import { db, isConfigured } from './firebase';
 import { readLocalGame, readLocalProfile, subscribeLocalGame, writeLocalGame } from './local';
 import { emptyBoard } from './game/board';
@@ -20,26 +20,52 @@ export async function createLocalGame(me: Player) {
 }
 
 export async function createRoom(me: Player) {
-  const code = genCode();
-  await setDoc(gref(code), newGame(code, 'private', me));
-  return code;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = genCode();
+    const created = await runTransaction(db!, async (tx) => {
+      const ref = gref(code);
+      if ((await tx.get(ref)).exists()) return false;
+      tx.set(ref, newGame(code, 'private', me));
+      return true;
+    });
+    if (created) return code;
+  }
+  throw new Error('Could not create a room. Please try again.');
 }
 export async function joinRoom(code: string, me: Player) {
-  const s = await getDoc(gref(code));
-  if (!s.exists()) throw new Error('No room with that code.');
-  const d = s.data() as GameDoc;
-  if (d.host.id === me.id || d.guest?.id === me.id) return;
-  if (d.guest) throw new Error('That room is full.');
-  await updateDoc(gref(code), { guest: me, status: 'role-select', log: [{ text: `${me.name} joined.` }] });
+  await runTransaction(db!, async (tx) => {
+    const ref = gref(code), s = await tx.get(ref);
+    if (!s.exists()) throw new Error('No room with that code.');
+    const d = s.data() as GameDoc;
+    if (d.host.id === me.id || d.guest?.id === me.id) return;
+    if (d.guest || d.status !== 'waiting') throw new Error('That room is full.');
+    tx.update(ref, { guest: me, status: 'role-select', log: [{ text: `${me.name} joined.` }] });
+  });
 }
 export async function pickRole(g: GameDoc, me: string, role: Role) {
-  if (g.status !== 'role-select' || !g.guest) return;
-  if (g.host.role === role || g.guest.role === role) return;
-  const key = g.host.id === me ? 'host' : 'guest', other = key === 'host' ? 'guest' : 'host';
-  const opp: Role = role === 'tiger' ? 'goat' : 'tiger';
-  await pushPatch(g.code, {
-    [key]: { ...g[key]!, role }, [other]: { ...g[other]!, role: opp }, status: 'playing',
-    log: [{ text: `${g[key]!.name} chose ${role}s.` }],
+  if (g.code === 'LOCAL') {
+    if (g.status !== 'role-select' || !g.guest || g.host.role === role || g.guest.role === role) return;
+    const key = g.host.id === me ? 'host' : 'guest', other = key === 'host' ? 'guest' : 'host';
+    const opp: Role = role === 'tiger' ? 'goat' : 'tiger';
+    await pushPatch(g.code, {
+      [key]: { ...g[key]!, role }, [other]: { ...g[other]!, role: opp }, status: 'playing',
+      log: [{ text: `${g[key]!.name} chose ${role}s.` }],
+    });
+    return;
+  }
+  await runTransaction(db!, async (tx) => {
+    const ref = gref(g.code), s = await tx.get(ref);
+    if (!s.exists()) throw new Error('The game was closed.');
+    const current = s.data() as GameDoc;
+    if (current.status !== 'role-select' || !current.guest) return;
+    const key = current.host.id === me ? 'host' : current.guest.id === me ? 'guest' : null;
+    if (!key || current.host.role === role || current.guest.role === role) return;
+    const other = key === 'host' ? 'guest' : 'host';
+    const opponentRole: Role = role === 'tiger' ? 'goat' : 'tiger';
+    tx.update(ref, {
+      [key]: { ...current[key]!, role }, [other]: { ...current[other]!, role: opponentRole },
+      status: 'playing', log: [{ text: `${current[key]!.name} chose ${role}s.` }],
+    });
   });
 }
 export async function pushPatch(code: string, patch: Partial<GameDoc>) {
@@ -66,48 +92,86 @@ export async function rematch(g: GameDoc) {
 let hostTimer: ReturnType<typeof setInterval> | null = null;
 export const stopHosting = () => { if (hostTimer) clearInterval(hostTimer); hostTimer = null; };
 const lobby = () => doc(db!, 'lobby', 'waiting');
+const MATCH_LEASE_MS = 45_000;
+interface LobbyEntry { code: string; hostId: string; ts: number | Timestamp }
+const isRecent = (entry: LobbyEntry) => Date.now() - (typeof entry.ts === 'number' ? entry.ts : entry.ts.toMillis()) < MATCH_LEASE_MS;
 
-export async function quickMatch(me: Player): Promise<string | null> {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const r = { join: null as string | null, host: null as string | null };
-    await runTransaction(db!, async (tx) => {
-      r.join = null; r.host = null;
-      const s = await tx.get(lobby());
-      const d = s.exists() ? (s.data() as any) : null;
-      if (d && d.code && Date.now() - d.ts < 45000 && d.hostId !== me.id) { r.join = d.code; tx.delete(lobby()); }
-      else { r.host = genCode(); tx.set(lobby(), { code: r.host, hostId: me.id, ts: Date.now() }); }
+function startHosting(code: string, hostId: string, onError: (error: Error) => void) {
+  stopHosting();
+  let reportedError = false;
+  hostTimer = setInterval(() => {
+    void runTransaction(db!, async (tx) => {
+      const ref = lobby(), s = await tx.get(ref);
+      if (!s.exists()) return;
+      const entry = s.data() as LobbyEntry;
+      if (entry.code === code && entry.hostId === hostId) tx.update(ref, { ts: serverTimestamp() });
+    }).then(() => { reportedError = false; }).catch((error: unknown) => {
+      if (!reportedError) onError(error instanceof Error ? error : new Error(String(error)));
+      reportedError = true;
     });
-    if (r.host) {
-      const code = r.host;
-      await setDoc(gref(code), newGame(code, 'quick', me));
-      hostTimer = setInterval(async () => {
-        try { const s = await getDoc(lobby()); if (s.exists() && (s.data() as any).hostId === me.id) await setDoc(lobby(), { code, hostId: me.id, ts: Date.now() }); } catch {}
-      }, 15000);
-      return code;
-    }
-    for (let i = 0; i < 8; i++) {
-      const s = await getDoc(gref(r.join!));
-      const d = s.exists() ? (s.data() as GameDoc) : null;
-      if (d && !d.guest && d.status === 'waiting') {
-        const hr: Role = Math.random() < 0.5 ? 'tiger' : 'goat';
-        try {
-          await updateDoc(gref(r.join!), { host: { ...d.host, role: hr }, guest: { ...me, role: hr === 'tiger' ? 'goat' : 'tiger' }, status: 'playing', log: [{ text: 'Match found!' }] });
-          return r.join!;
-        } catch { break; }
+  }, 15_000);
+}
+
+export async function quickMatch(me: Player, onError: (error: Error) => void) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let result: { kind: 'host' | 'matched' | 'retry'; code?: string };
+    const newCode = genCode();
+    result = await runTransaction(db!, async (tx) => {
+      const queueRef = lobby(), queueSnap = await tx.get(queueRef);
+      const entry = queueSnap.exists() ? queueSnap.data() as LobbyEntry : null;
+      if (entry?.code && entry.hostId !== me.id && isRecent(entry)) {
+        const gameRef = gref(entry.code), gameSnap = await tx.get(gameRef);
+        if (gameSnap.exists()) {
+          const game = gameSnap.data() as GameDoc;
+          if (game.host.id === entry.hostId && game.status === 'waiting' && !game.guest) {
+            const hostRole: Role = Math.random() < 0.5 ? 'tiger' : 'goat';
+            tx.update(gameRef, {
+              host: { ...game.host, role: hostRole },
+              guest: { ...me, role: hostRole === 'tiger' ? 'goat' : 'tiger' },
+              status: 'playing', log: [{ text: 'Match found!' }],
+            });
+            tx.delete(queueRef);
+            return { kind: 'matched', code: entry.code };
+          }
+        }
+      } else if (entry?.code && entry.hostId === me.id && isRecent(entry)) {
+        const gameRef = gref(entry.code), gameSnap = await tx.get(gameRef);
+        if (gameSnap.exists()) {
+          const game = gameSnap.data() as GameDoc;
+          if (game.host.id === me.id && game.status === 'waiting' && !game.guest)
+            return { kind: 'host', code: entry.code };
+        }
       }
-      await new Promise((res) => setTimeout(res, 450));
-    }
+
+      const gameRef = gref(newCode), gameSnap = await tx.get(gameRef);
+      if (gameSnap.exists()) return { kind: 'retry' };
+      tx.set(gameRef, newGame(newCode, 'quick', me));
+      tx.set(queueRef, { code: newCode, hostId: me.id, ts: serverTimestamp() });
+      return { kind: 'host', code: newCode };
+    });
+
+    if (result.kind === 'retry') continue;
+    if (!result.code) continue;
+    if (result.kind === 'host') startHosting(result.code, me.id, onError);
+    return result.code;
   }
   return null;
 }
 export async function cancelWaiting(g: GameDoc | null, me: string) {
   stopHosting();
-  if (!g || g.mode === 'local' || g.status !== 'waiting' || g.host.id !== me) return;
-  try {
-    const s = await getDoc(lobby());
-    if (s.exists() && (s.data() as any).code === g.code) await deleteDoc(lobby());
-    await deleteDoc(gref(g.code));
-  } catch {}
+  if (!g || g.mode === 'local' || g.status !== 'waiting' || g.host.id !== me || !isConfigured) return;
+  await runTransaction(db!, async (tx) => {
+    const gameRef = gref(g.code), queueRef = lobby();
+    const [gameSnap, queueSnap] = await Promise.all([tx.get(gameRef), tx.get(queueRef)]);
+    if (queueSnap.exists()) {
+      const entry = queueSnap.data() as LobbyEntry;
+      if (entry.code === g.code && entry.hostId === me) tx.delete(queueRef);
+    }
+    if (gameSnap.exists()) {
+      const game = gameSnap.data() as GameDoc;
+      if (game.host.id === me && game.status === 'waiting' && !game.guest) tx.delete(gameRef);
+    }
+  });
 }
 
 /* ---------- profile + leaderboard ---------- */

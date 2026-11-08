@@ -60,7 +60,8 @@ export default function App() {
   }, [uid, profile.name]);
 
   const home = async () => {
-    await svc.cancelWaiting(gameRef.current, uid);
+    try { await svc.cancelWaiting(gameRef.current, uid); }
+    catch (e) { setError(`Could not cancel matchmaking: ${e instanceof Error ? e.message : 'connection error'}`); }
     setCode(null); setGame(null); setSearching(false); setRules(false); localStorage.removeItem('sc_last'); refresh();
   };
   const saveProf = (name: string, avatar: string) => {
@@ -72,15 +73,20 @@ export default function App() {
   if (!ready) view = <div className="col"><p className="tag">Loading…</p></div>;
   else if (!profile.name || editing || !uid) view = <ProfileScreen initial={profile} onDone={saveProf} error={error} />;
   else if (rules) view = <RulesScreen onClose={() => setRules(false)} />;
-  else if (searching && !game) view = <WaitScreen title="Searching worldwide…" sub="Looking for an opponent anywhere on Earth." onCancel={home} />;
+  else if (searching && !game) view = <WaitScreen title="Searching worldwide…" sub="Looking for an opponent anywhere on Earth." error={error} onCancel={home} />;
   else if (game?.status === 'waiting') view = <WaitScreen title={game.mode === 'quick' ? 'Searching worldwide…' : 'Room created'} code={game.mode === 'private' ? game.code : undefined}
-    sub={game.mode === 'private' ? 'Share this code or link. Your friend opens it on their own device.' : 'Looking for an opponent anywhere on Earth.'} onCancel={home} />;
+    sub={game.mode === 'private' ? 'Share this code or link. Your friend opens it on their own device.' : 'Looking for an opponent anywhere on Earth.'} error={error} onCancel={home} />;
   else if (game?.status === 'role-select') view = <RoleScreen game={game} onPick={(r) => guard(() => svc.pickRole(game, uid, r))} />;
   else if (game?.status === 'playing') view = <GameScreen game={game} uid={uid} onRules={() => setRules(true)}
     onResign={() => { if (confirm('Resign this game? You will lose.')) guard(() => svc.resign(game, game.mode === 'local' ? (game.host.role === game.turn ? game.host.id : game.guest!.id) : uid)); }} />;
   else if (game?.status === 'finished') view = <EndScreen game={game} uid={uid} onRematch={() => guard(() => svc.rematch(game))} onHome={home} />;
   else view = <HomeScreen profile={profile} board={board} error={error} initialCode={isConfigured ? invite : ''} onLocal={() => guard(async () => { enter(await svc.createLocalGame(me())); })}
-    onQuick={() => guard(async () => { setSearching(true); const c = await svc.quickMatch(me()); if (!c) throw new Error('No match found, try again.'); enter(c); })}
+    onQuick={() => guard(async () => {
+      setSearching(true);
+      const c = await svc.quickMatch(me(), (e) => setError(`Matchmaking connection lost: ${e.message}`));
+      if (!c) throw new Error('No match found, try again.');
+      enter(c);
+    })}
     onCreate={() => guard(async () => { enter(await svc.createRoom(me())); })}
     onJoin={(c) => guard(async () => { if (c.length !== 4) throw new Error('Enter the 4-letter code.'); await svc.joinRoom(c, me()); enter(c); })}
     onEdit={() => setEditing(true)} onRules={() => setRules(true)} />;

@@ -63,7 +63,7 @@ export function HomeScreen(p: { profile: Profile; board: { name: string; avatar:
   );
 }
 
-export function WaitScreen({ title, code, sub, onCancel }: { title: string; code?: string; sub: string; onCancel: () => void }) {
+export function WaitScreen({ title, code, sub, error, onCancel }: { title: string; code?: string; sub: string; error?: string; onCancel: () => void }) {
   return (
     <div className="col">
       <Logo />
@@ -73,6 +73,7 @@ export function WaitScreen({ title, code, sub, onCancel }: { title: string; code
         <div className="radar" aria-hidden="true"><i /></div>
         <p className="sub">{sub}</p>
         {code && <ShareButton code={code} />}
+        <Err text={error || ''} />
         <Btn onClick={onCancel}>Cancel</Btn>
       </Card>
     </div>
